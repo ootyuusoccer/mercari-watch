@@ -186,4 +186,3 @@ jobs:
           else
             echo "last_seen.json の変更なし"
           fi
-
