@@ -50,8 +50,8 @@ jobs:
             console.log(`🔍 Checking: ${t.name}`);
             await page.goto(t.url, { waitUntil: 'domcontentloaded', timeout: 60000 });
 
-            const priceElements = await page.$$eval('div[data-testid="listing-card"] span', els =>
-              els.map(e => e.textContent)
+            const priceElements = await page.$$eval('div[data-testid="item-price"]', els =>
+                els.map(e => e.textContent)
             );
 
             const prices = priceElements
