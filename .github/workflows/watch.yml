@@ -21,7 +21,7 @@ jobs:
         with:
           node-version: 20
 
-      # Playwright 実行に必要なライブラリを先に入れる（Ubuntu 24.04 対応）
+      # Playwright 実行に必要なライブラリ（Ubuntu 24.04 対応）※元のまま
       - name: Install Playwright (browsers)
         run: |
           sudo apt-get update
@@ -43,20 +43,27 @@ jobs:
           npm i -D playwright
           npx playwright install --with-deps chromium
 
-      # ここで実際の監視ロジックを実行（1回の Chromium で順に巡回）
+      # nodemailer を入れる（通知用・軽量）
+      - name: Install npm deps
+        run: |
+          npm i nodemailer
+
+      # 巡回＆新着検出（元コード）＋ 新着時に Gmail 通知
       - name: Run Mercari Watcher
         env:
           GITHUB_STEP_SUMMARY: ${{ github.step_summary }}
+          MAIL_USERNAME: ${{ secrets.MAIL_USERNAME }}
+          MAIL_PASSWORD: ${{ secrets.MAIL_PASSWORD }}
+          MAIL_TO: ${{ secrets.MAIL_TO }}
         run: |
           node <<'EOF'
           import fs from 'fs';
+          import nodemailer from 'nodemailer';
           import { chromium } from 'playwright';
 
-          // CSV: name,url,max_price
+          // ===== 既存どおり：targets.csv 取り込み =====
           const csvPath = 'targets.csv';
-          if (!fs.existsSync(csvPath)) {
-            console.log('targets.csv がありません。'); process.exit(0);
-          }
+          if (!fs.existsSync(csvPath)) { console.log('targets.csv がありません。'); process.exit(0); }
           const lines = fs.readFileSync(csvPath,'utf8')
             .split('\n').map(s=>s.trim()).filter(Boolean);
           const header = lines.shift(); // 1行目ヘッダ
@@ -65,7 +72,7 @@ jobs:
             return { name, url, maxPrice: parseInt(max_price||'0',10) || 0 };
           });
 
-          // 既知IDを保存するファイル
+          // ===== 既存どおり：last_seen.json 読み書き =====
           const seenPath = 'last_seen.json';
           let seen = {};
           try { seen = JSON.parse(fs.readFileSync(seenPath,'utf8')); } catch {}
@@ -78,10 +85,9 @@ jobs:
             if (!t.url) continue;
             console.log(`🔎 Checking: ${t.name}`);
 
-            // 検索ページへ遷移
             await page.goto(t.url, { waitUntil: 'domcontentloaded', timeout: 60000 });
 
-            // SPA が投げる API 応答を待つ（entities:search）
+            // Mercari の SPA が投げる API 応答（entities:search）を待つ
             let data = null;
             try {
               const resp = await page.waitForResponse(
@@ -89,53 +95,86 @@ jobs:
                 { timeout: 15000 }
               );
               data = await resp.json();
-            } catch (e) {
+            } catch {
               console.log(`⚠️ ${t.name}: 価格情報が取得できませんでした`);
               continue;
             }
 
             const item = (data?.items && data.items[0]) ? data.items[0] : null;
-            if (!item) { 
-              console.log(`⚠️ ${t.name}: ヒット0件`); 
-              continue; 
-            }
+            if (!item) { console.log(`⚠️ ${t.name}: ヒット0件`); continue; }
 
             const id = item.id;
             const price = parseInt(item.price || '0',10);
             const status = item.status || '';
             const url = `https://jp.mercari.com/item/${id}`;
 
-            // 新規出品 & 上限価格以下 & 販売中 を通知対象に
             const isNew = seen[t.name] !== id;
             const isOnSale = status.includes('TRADING') || status.includes('ON_SALE') || status === 'ITEM_STATUS_TRADING';
             const priceOk = (t.maxPrice === 0) || (price > 0 && price <= t.maxPrice);
 
             if (isNew && isOnSale && priceOk) {
-              foundMsgs.push(`- **${t.name}** 新着: ¥${price.toLocaleString()} → ${url}`);
+              foundMsgs.push({ name: t.name, price, url, id, prev: seen[t.name] || '' });
               seen[t.name] = id;  // 記録更新
             } else {
-              // 初回実行で学習だけ／または条件合わず
-              if (!seen[t.name]) seen[t.name] = id;
+              if (!seen[t.name]) seen[t.name] = id; // 初回は学習だけ
             }
           }
 
           await browser.close();
 
-          // 結果を Summary に書く（GitHub Actions 画面で見える）
+          // ===== Summary（元の表示） =====
           const linesOut = [];
           if (foundMsgs.length) {
-            linesOut.push('## 🛎 新着検出\n', ...foundMsgs, '\n');
+            linesOut.push('## 🛎 新着検出\n');
+            for (const x of foundMsgs) {
+              linesOut.push(`- **${x.name}** 新着: ¥${x.price.toLocaleString()} → ${x.url}`);
+            }
+            linesOut.push('');
           } else {
             linesOut.push('新着はありません。');
           }
           fs.appendFileSync(process.env.GITHUB_STEP_SUMMARY || 'summary.md', linesOut.join('\n'));
 
-          // 状態を保存
+          // ===== Gmail 通知（新着がある時だけ） =====
+          if (foundMsgs.length) {
+            const user = process.env.MAIL_USERNAME;
+            const pass = process.env.MAIL_PASSWORD;
+            const to   = process.env.MAIL_TO || user;
+
+            if (user && pass) {
+              const transporter = nodemailer.createTransport({
+                host: 'smtp.gmail.com',
+                port: 465,
+                secure: true,
+                auth: { user, pass }
+              });
+
+              const text = foundMsgs.map(x =>
+                `【${x.name}】¥${x.price}\n${x.url}\nnew:${x.id} prev:${x.prev}\n`
+              ).join('\n');
+
+              try {
+                await transporter.sendMail({
+                  from: user,
+                  to,
+                  subject: `Mercari 新着 ${foundMsgs.length}件`,
+                  text
+                });
+                console.log('📧 Gmail 送信 OK');
+              } catch (e) {
+                console.log('📧 Gmail 送信失敗:', e?.message || e);
+              }
+            } else {
+              console.log('📧 MAIL_USERNAME / MAIL_PASSWORD が未設定（通知スキップ）');
+            }
+          }
+
+          // ===== 状態保存（既存どおり） =====
           fs.writeFileSync(seenPath, JSON.stringify(seen, null, 2));
           console.log('Watch 完了');
           EOF
 
-      # 変更があれば last_seen.json をコミット（初回学習や新着時に更新）
+      # 変更があれば last_seen.json をコミット（元のまま）
       - name: Commit last_seen.json
         run: |
           if git status --porcelain | grep -q "last_seen.json"; then
