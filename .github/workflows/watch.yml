@@ -2,8 +2,12 @@ name: Mercari Watch
 
 on:
   schedule:
-    - cron: "*/15 * * * *" # 15分ごとに実行
-  workflow_dispatch:
+    - cron: "*/15 * * * *"   # 15分ごとに実行
+  workflow_dispatch:         # 手動実行も可
+
+permissions:
+  contents: write   # last_seen.json をコミット
+  issues: write     # 通知として Issue を作成
 
 jobs:
   check:
@@ -11,66 +15,123 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
 
-      - name: Set Up Node.js
-        uses: actions/setup-node@v3
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
         with:
           node-version: 20
 
       - name: Install dependencies
         run: |
-          npm install playwright@1.44.0 node-fetch@3.3.2
+          npm i -D playwright@1.44.0
 
       - name: Install Playwright (browsers)
         run: |
-          npm i -D playwright
           npx playwright install --with-deps chromium
 
       - name: Run Mercari Watcher
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           node <<'EOF'
           import fs from 'fs';
-          import fetch from 'node-fetch';
           import { chromium } from 'playwright';
 
-          const targets = fs.readFileSync('targets.csv', 'utf8')
-            .trim()
-            .split('\n')
-            .slice(1)
-            .map(line => {
-              const [name, url, max_price] = line.split(',');
-              return { name, url, max_price: parseInt(max_price, 10) };
-            });
+          // ---- helpers ----
+          const REPO = process.env.GITHUB_REPOSITORY;      // owner/repo
+          const TOKEN = process.env.GITHUB_TOKEN;
+          const [OWNER, REPO_NAME] = REPO.split('/');
+
+          const readCSV = (path) =>
+            fs.readFileSync(path, 'utf8')
+              .trim().split('\n').slice(1)
+              .map(line => {
+                const [name, url] = line.split(',');
+                return { name: name.trim(), url: url.trim() };
+              });
+
+          const readLastSeen = (path) =>
+            fs.existsSync(path) ? JSON.parse(fs.readFileSync(path, 'utf8')) : {};
+
+          const writeLastSeen = (path, obj) =>
+            fs.writeFileSync(path, JSON.stringify(obj, null, 2));
+
+          // ---- main ----
+          const targets = readCSV('targets.csv');       // name,url,(max_price) のCSV
+          const lastSeen = readLastSeen('last_seen.json');
 
           const browser = await chromium.launch();
-          const page = await browser.newPage();
+          const ctx = await browser.newContext({
+            userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36',
+            locale: 'ja-JP'
+          });
+          const page = await ctx.newPage();
+
+          const newFinds = [];
 
           for (const t of targets) {
-            console.log(`🔍 Checking: ${t.name}`);
-            await page.goto(t.url, { waitUntil: 'domcontentloaded', timeout: 60000 });
+            // 新着順付与（無ければ）
+            let url = t.url;
+            if (!/sort=created_time/.test(url)) {
+              url += (url.includes('?') ? '&' : '?') + 'sort=created_time&order=desc';
+            }
 
-            const priceElements = await page.$$eval('div[data-testid="item-price"]', els =>
-                els.map(e => e.textContent)
-            );
+            console.log(`🔎 Checking: ${t.name}`);
+            await page.goto(url, { waitUntil: 'networkidle' });
 
-            const prices = priceElements
-              .map(p => p.replace(/[^\d]/g, ''))
-              .filter(p => p)
-              .map(Number);
+            // 先頭商品IDをHTMLから拾う
+            const html = await page.content();
+            const m = html.match(/\/item\/(m[0-9A-Za-z]+)/);
+            const newId = m ? m[1] : null;
 
-            if (prices.length > 0) {
-              const minPrice = Math.min(...prices);
-              console.log(`💰 ${t.name}: 最安値 ${minPrice}円 (上限 ${t.max_price}円)`);
+            if (!newId) {
+              console.log(`⚠️ ${t.name}: 先頭商品IDが取得できませんでした`);
+              continue;
+            }
 
-              if (minPrice <= t.max_price) {
-                console.log(`🚨 条件一致: ${t.name} が ${minPrice}円で出品中！`);
-              }
-            } else {
-              console.log(`⚠️ ${t.name}: 価格情報が取得できませんでした`);
+            const prev = lastSeen[t.name];
+            console.log(`   id(new)=${newId}  id(prev)=${prev || '(none)'}`);
+
+            if (!prev || prev !== newId) {
+              newFinds.push({ ...t, newId });
+              lastSeen[t.name] = newId;   // 更新
             }
           }
 
           await browser.close();
-          console.log("✅ Watch 完了");
+
+          // 通知（Issue作成）※GitHubの通知設定で受け取れる
+          if (newFinds.length) {
+            const title = `🆕 Mercari 新着 ${newFinds.length} 件`;
+            const lines = newFinds.map(n =>
+              `- **${n.name}**\n  https://jp.mercari.com/item/${n.newId}\n  検索: ${n.url}`
+            ).join('\n\n');
+            const body = `以下の検索で新着を検出しました。\n\n${lines}\n\n_auto via GitHub Actions_`;
+
+            await fetch(`https://api.github.com/repos/${OWNER}/${REPO_NAME}/issues`, {
+              method: 'POST',
+              headers: {
+                'Authorization': `Bearer ${TOKEN}`,
+                'Accept': 'application/vnd.github+json'
+              },
+              body: JSON.stringify({ title, body })
+            });
+            console.log('📣 Issue 通知を作成しました');
+          } else {
+            console.log('✅ 新着なし');
+          }
+
+          // 記録を保存
+          writeLastSeen('last_seen.json', lastSeen);
+          console.log('💾 last_seen.json を更新');
           EOF
+
+      - name: Commit last_seen.json
+        if: always()
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add last_seen.json
+          git commit -m "chore: update last_seen" || echo "no changes"
+          git push
