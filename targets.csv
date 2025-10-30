@@ -2,3 +2,6 @@ name,url,max_price
 WSR-1500AX2L,https://jp.mercari.com/search?keyword=WSR-1500AX2L&sort=created_time&order=desc,4500
 WSR-5400AX6P-BK,https://jp.mercari.com/search?keyword=WSR-5400AX6P-BK&sort=created_time&order=desc,9000
 ポケモンカード,https://jp.mercari.com/search?keyword=%E3%83%9D%E3%82%B1%E3%83%A2%E3%83%B3%E3%82%AB%E3%83%BC%E3%83%89&sort=created_time&order=desc,999999
+サッカーボール,https://jp.mercari.com/search?keyword=%E3%82%B5%E3%83%83%E3%82%AB%E3%83%BC%E3%83%9C%E3%83%BC%E3%83%AB&sort=created_time&order=desc,9999
+ゴルフクラブ,https://jp.mercari.com/search?keyword=%E3%82%B4%E3%83%AB%E3%83%95%E3%82%AF%E3%83%A9%E3%83%96&sort=created_time&order=desc,99999
+iphone15,https://jp.mercari.com/search?keyword=iphone15%E3%80%80%E6%9C%AC%E4%BD%93&sort=created_time&order=desc&category_id=860,999999
