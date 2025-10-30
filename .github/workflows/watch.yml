@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write   # last_seen.json をコミットするため
+  contents: write
 
 jobs:
   check:
@@ -16,201 +16,134 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Setup Node.js
+      - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
           node-version: 20
 
-      # Playwright の依存&ブラウザを公式アクションで一括導入（libasound系エラーを回避）
-      - name: Install Playwright browsers & deps
-        uses: microsoft/playwright-github-action@v1
-        with:
-          with-deps: true
-
-      - name: Install npm deps
+      # Playwright 実行に必要なライブラリを先に入れる（Ubuntu 24.04 対応）
+      - name: Install Playwright (browsers)
         run: |
-          npm i nodemailer@6 playwright@1
+          sudo apt-get update
+          sudo apt-get install -y \
+            libasound2t64 \
+            libnss3 \
+            libxss1 \
+            libgtk-3-0 \
+            libx11-xcb1 \
+            libxcb1 \
+            libxcomposite1 \
+            libxdamage1 \
+            libxrandr2 \
+            libgbm1 \
+            libpango-1.0-0 \
+            libcairo2 \
+            libatspi2.0-0 \
+            libdrm2
+          npm i -D playwright
+          npx playwright install --with-deps chromium
 
+      # ここで実際の監視ロジックを実行（1回の Chromium で順に巡回）
       - name: Run Mercari Watcher
         env:
-          MAIL_USERNAME: ${{ secrets.MAIL_USERNAME }}
-          MAIL_PASSWORD: ${{ secrets.MAIL_PASSWORD }}
-          MAIL_TO: ${{ secrets.MAIL_TO }}
+          GITHUB_STEP_SUMMARY: ${{ github.step_summary }}
         run: |
-          node --input-type=module <<'EOF'
+          node <<'EOF'
           import fs from 'fs';
           import { chromium } from 'playwright';
-          import nodemailer from 'nodemailer';
 
-          // ====== ユーティリティ ======
-          const sleep = (ms)=>new Promise(r=>setTimeout(r,ms));
-
-          // CSV読み込み（ヘッダ厳密除外・全角カンマ対策・壊れ行スキップ）
-          const raw = fs.readFileSync('targets.csv','utf8').replace(/\uFEFF/g,'');
-          const lines = raw.split(/\r?\n/).map(l=>l.replace(/\s+$/,'')).filter(l=>l.trim());
-          const dataLines = lines.filter((l,i)=> i!==0 && !/^name\s*,\s*url\s*,\s*max_price\s*$/i.test(l.trim()));
-
-          const targets = [];
-          for (let i=0;i<dataLines.length;i++){
-            const line = dataLines[i].replace(/，/g, ',').trim();
-            const parts = line.split(',');
-            if (parts.length < 3){ console.log(`⛔ 列不足: ${line}`); continue; }
-            const name = parts[0].trim();
-            const urlStr = parts.slice(1, parts.length-1).join(',').trim();
-            const priceStr = parts[parts.length-1].trim();
-            if (!/^https?:\/\//.test(urlStr)){ console.log(`⛔ URL不正: ${urlStr}`); continue; }
-            let url; try{ url = new URL(urlStr).toString(); }catch{ console.log(`⛔ URL構文: ${urlStr}`); continue; }
-            const max_price = Number(priceStr.replace(/[^\d]/g,''));
-            if (!Number.isFinite(max_price)){ console.log(`⛔ max_price不正: ${priceStr}`); continue; }
-            targets.push({ name, url, max_price });
+          // CSV: name,url,max_price
+          const csvPath = 'targets.csv';
+          if (!fs.existsSync(csvPath)) {
+            console.log('targets.csv がありません。'); process.exit(0);
           }
-
-          if (targets.length===0){
-            console.log('⛔ 有効ターゲット0。CSVの3列/URL/余計な空白を確認して。');
-            process.exit(1);
-          }
-          console.log('✅ 有効ターゲット数:', targets.length);
-
-          // last_seen の読み書き
-          let lastSeen = {};
-          try { lastSeen = JSON.parse(fs.readFileSync('last_seen.json','utf8')); } catch {}
-          
-          // メール送信器
-          const toAddr = process.env.MAIL_TO?.trim() || process.env.MAIL_USERNAME;
-          const transporter = nodemailer.createTransport({
-            host: 'smtp.gmail.com',
-            port: 465,
-            secure: true,
-            auth: { user: process.env.MAIL_USERNAME, pass: process.env.MAIL_PASSWORD },
+          const lines = fs.readFileSync(csvPath,'utf8')
+            .split('\n').map(s=>s.trim()).filter(Boolean);
+          const header = lines.shift(); // 1行目ヘッダ
+          const targets = lines.map(l=>{
+            const [name,url,max_price] = l.split(',');
+            return { name, url, maxPrice: parseInt(max_price||'0',10) || 0 };
           });
 
-          // Playwright起動
-          const browser = await chromium.launch();
-          const ctx = await browser.newContext({
-            userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36',
-            locale: 'ja-JP',
-          });
-          const page = await ctx.newPage();
+          // 既知IDを保存するファイル
+          const seenPath = 'last_seen.json';
+          let seen = {};
+          try { seen = JSON.parse(fs.readFileSync(seenPath,'utf8')); } catch {}
 
-          // Mercari検索 → XHR /v2/entities:search を傍受して最新商品取得
-          async function fetchLatestItem(searchUrl){
-            let latest = null;
+          const browser = await chromium.launch({ headless: true });
+          const page = await browser.newPage();
 
-            const respWait = page.waitForResponse(resp => {
-              try {
-                const u = new URL(resp.url());
-                return u.hostname.endsWith('api.mercari.jp') && u.pathname.includes('/v2/entities:search');
-              } catch { return false; }
-            }, { timeout: 15000 }).catch(() => null);
-
-            // 検索URLへ
-            await page.goto(searchUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
-
-            const apiResp = await respWait;
-            if (apiResp && apiResp.ok()){
-              try{
-                const json = await apiResp.json();
-                const item = json?.items?.[0];
-                if (item){
-                  latest = {
-                    id: item.id || item?.item?.id,
-                    name: item.name || item?.item?.name,
-                    price: Number(item.price || item?.item?.price || 0),
-                    created: item.created || item?.item?.created,
-                    url: item.id ? `https://jp.mercari.com/item/${item.id}` : null,
-                    thumb: (item.thumbnails && item.thumbnails[0]) || null
-                  };
-                }
-              }catch(e){ /* だんまり */ }
-            }
-
-            // 万一取れなければ次善策：HTMLから item/xxxxxxxx を抜く
-            if (!latest){
-              const html = await page.content();
-              const m = html.match(/\/item\/([m0-9A-Za-z]{10,})/);
-              if (m){
-                latest = { id: m[1], url: `https://jp.mercari.com/item/${m[1]}` };
-              }
-            }
-            return latest;
-          }
-
-          // 通知本文
-          function buildMailHtml(t, latest){
-            const lines = [
-              `<b>${t.name}</b> に新着または条件一致:`,
-              latest.name ? `<div>タイトル: ${latest.name}</div>` : '',
-              latest.price ? `<div>価格: ¥${latest.price.toLocaleString()}</div>` : '',
-              latest.url ? `<div><a href="${latest.url}">${latest.url}</a></div>` : '',
-              `<div>検索URL: <a href="${t.url}">${t.url}</a></div>`
-            ].filter(Boolean).join('');
-            return `<div>${lines}</div>`;
-          }
-
-          let changed = false;
-
-          for (const t of targets){
+          const foundMsgs = [];
+          for (const t of targets) {
+            if (!t.url) continue;
             console.log(`🔎 Checking: ${t.name}`);
+
+            // 検索ページへ遷移
+            await page.goto(t.url, { waitUntil: 'domcontentloaded', timeout: 60000 });
+
+            // SPA が投げる API 応答を待つ（entities:search）
+            let data = null;
             try {
-              const latest = await fetchLatestItem(t.url);
-              if (!latest || !latest.id){
-                console.log(`⚠ ${t.name}: 価格/IDの取得不可`);
-                continue;
-              }
+              const resp = await page.waitForResponse(
+                r => r.url().includes('/v2/entities:search') && r.ok(),
+                { timeout: 15000 }
+              );
+              data = await resp.json();
+            } catch (e) {
+              console.log(`⚠️ ${t.name}: 価格情報が取得できませんでした`);
+              continue;
+            }
 
-              // 新着 or 価格条件
-              const prev = lastSeen[t.name];
-              const isNew = prev !== latest.id;
-              const priceOk = !t.max_price || (latest.price>0 && latest.price <= t.max_price);
+            const item = (data?.items && data.items[0]) ? data.items[0] : null;
+            if (!item) { 
+              console.log(`⚠️ ${t.name}: ヒット0件`); 
+              continue; 
+            }
 
-              if (isNew || priceOk){
-                // メール通知
-                if (!process.env.MAIL_USERNAME || !process.env.MAIL_PASSWORD){
-                  console.log('⚠ メールSecrets未設定（MAIL_USERNAME/MAIL_PASSWORD）');
-                } else {
-                  const subject = `Mercari: ${t.name} ${isNew ? '新着' : '更新'} / ¥${(latest.price||0).toLocaleString()}`;
-                  await transporter.sendMail({
-                    from: process.env.MAIL_USERNAME,
-                    to: toAddr,
-                    subject,
-                    html: buildMailHtml(t, latest),
-                  });
-                  console.log(`📧 通知送信: ${subject}`);
-                }
-              }
+            const id = item.id;
+            const price = parseInt(item.price || '0',10);
+            const status = item.status || '';
+            const url = `https://jp.mercari.com/item/${id}`;
 
-              // 既読ID更新
-              if (prev !== latest.id){
-                lastSeen[t.name] = latest.id;
-                changed = true;
-              }
+            // 新規出品 & 上限価格以下 & 販売中 を通知対象に
+            const isNew = seen[t.name] !== id;
+            const isOnSale = status.includes('TRADING') || status.includes('ON_SALE') || status === 'ITEM_STATUS_TRADING';
+            const priceOk = (t.maxPrice === 0) || (price > 0 && price <= t.maxPrice);
 
-              await sleep(1000); // 負荷&BAN回避のインターバル
-            } catch(e){
-              console.log(`⛔ ${t.name}: ${e?.message||e}`);
+            if (isNew && isOnSale && priceOk) {
+              foundMsgs.push(`- **${t.name}** 新着: ¥${price.toLocaleString()} → ${url}`);
+              seen[t.name] = id;  // 記録更新
+            } else {
+              // 初回実行で学習だけ／または条件合わず
+              if (!seen[t.name]) seen[t.name] = id;
             }
           }
 
           await browser.close();
 
-          // 変更あれば last_seen.json を保存
-          if (changed){
-            fs.writeFileSync('last_seen.json', JSON.stringify(lastSeen, null, 2));
-            console.log('💾 last_seen.json を更新');
+          // 結果を Summary に書く（GitHub Actions 画面で見える）
+          const linesOut = [];
+          if (foundMsgs.length) {
+            linesOut.push('## 🛎 新着検出\n', ...foundMsgs, '\n');
           } else {
-            console.log('— 変更なし —');
+            linesOut.push('新着はありません。');
           }
+          fs.appendFileSync(process.env.GITHUB_STEP_SUMMARY || 'summary.md', linesOut.join('\n'));
+
+          // 状態を保存
+          fs.writeFileSync(seenPath, JSON.stringify(seen, null, 2));
+          console.log('Watch 完了');
           EOF
 
+      # 変更があれば last_seen.json をコミット（初回学習や新着時に更新）
       - name: Commit last_seen.json
-        if: always()
         run: |
           if git status --porcelain | grep -q "last_seen.json"; then
             git config user.name "github-actions[bot]"
-            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
             git add last_seen.json
             git commit -m "chore: update last_seen.json"
             git push
           else
-            echo "No changes to commit."
+            echo "last_seen.json の変更なし"
           fi
