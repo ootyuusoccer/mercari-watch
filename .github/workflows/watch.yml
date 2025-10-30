@@ -21,7 +21,12 @@ jobs:
       - name: Install dependencies
         run: |
           npm install playwright@1.44.0 node-fetch@3.3.2
-
+          
+      - name: Install Playwright (browsers)
+        run: |
+          npm i -D playwright
+          npx playwright install --with-deps chromium
+          
       - name: Run Mercari Watcher
         run: |
           node <<'EOF'
