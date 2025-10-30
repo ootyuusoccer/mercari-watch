@@ -74,4 +74,3 @@ jobs:
           await browser.close();
           console.log("✅ Watch 完了");
           EOF
-          EOF
