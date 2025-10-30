@@ -2,7 +2,7 @@ name: Mercari Watch
 
 on:
   schedule:
-    - cron: "*/15 * * * *"   # 15分ごと
+    - cron: "*/15 * * * *"  # 15分ごとに実行
   workflow_dispatch:
 
 permissions:
@@ -21,129 +21,85 @@ jobs:
         with:
           node-version: 20
 
-      # Playwright 実行に必要なライブラリを先に入れる（Ubuntu 24.04 対応）
-      - name: Install Playwright (browsers)
+      - name: Install dependencies
         run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            libasound2t64 \
-            libnss3 \
-            libxss1 \
-            libgtk-3-0 \
-            libx11-xcb1 \
-            libxcb1 \
-            libxcomposite1 \
-            libxdamage1 \
-            libxrandr2 \
-            libgbm1 \
-            libpango-1.0-0 \
-            libcairo2 \
-            libatspi2.0-0 \
-            libdrm2
-          npm i -D playwright
+          npm install playwright@1.44.0 node-fetch@3.3.2
           npx playwright install --with-deps chromium
 
-      # ここで実際の監視ロジックを実行（1回の Chromium で順に巡回）
       - name: Run Mercari Watcher
-        env:
-          GITHUB_STEP_SUMMARY: ${{ github.step_summary }}
         run: |
           node <<'EOF'
           import fs from 'fs';
+          import fetch from 'node-fetch';
           import { chromium } from 'playwright';
 
-          // CSV: name,url,max_price
-          const csvPath = 'targets.csv';
-          if (!fs.existsSync(csvPath)) {
-            console.log('targets.csv がありません。'); process.exit(0);
-          }
-          const lines = fs.readFileSync(csvPath,'utf8')
-            .split('\n').map(s=>s.trim()).filter(Boolean);
-          const header = lines.shift(); // 1行目ヘッダ
-          const targets = lines.map(l=>{
-            const [name,url,max_price] = l.split(',');
-            return { name, url, maxPrice: parseInt(max_price||'0',10) || 0 };
-          });
+          const targets = fs.readFileSync('targets.csv', 'utf8')
+            .trim().split('\n').slice(1)
+            .map(line => {
+              const [name, url, max_price] = line.split(',');
+              return { name, url, max_price: parseInt(max_price, 10) };
+            });
 
-          // 既知IDを保存するファイル
-          const seenPath = 'last_seen.json';
-          let seen = {};
-          try { seen = JSON.parse(fs.readFileSync(seenPath,'utf8')); } catch {}
+          const lastSeenPath = 'last_seen.json';
+          const lastSeen = fs.existsSync(lastSeenPath)
+            ? JSON.parse(fs.readFileSync(lastSeenPath, 'utf8'))
+            : {};
 
           const browser = await chromium.launch({ headless: true });
           const page = await browser.newPage();
 
-          const foundMsgs = [];
+          let newItems = [];
+
           for (const t of targets) {
-            if (!t.url) continue;
-            console.log(`🔎 Checking: ${t.name}`);
-
-            // 検索ページへ遷移
+            console.log(`🔍 Checking: ${t.name}`);
             await page.goto(t.url, { waitUntil: 'domcontentloaded', timeout: 60000 });
+            const ids = await page.$$eval('[data-testid="item-cell"] a', as => as.map(a => a.href.split('/').pop()));
 
-            // SPA が投げる API 応答を待つ（entities:search）
-            let data = null;
-            try {
-              const resp = await page.waitForResponse(
-                r => r.url().includes('/v2/entities:search') && r.ok(),
-                { timeout: 15000 }
-              );
-              data = await resp.json();
-            } catch (e) {
-              console.log(`⚠️ ${t.name}: 価格情報が取得できませんでした`);
+            if (!ids.length) {
+              console.log(`⚠️ ${t.name}: 出品が見つかりません`);
               continue;
             }
 
-            const item = (data?.items && data.items[0]) ? data.items[0] : null;
-            if (!item) { 
-              console.log(`⚠️ ${t.name}: ヒット0件`); 
-              continue; 
+            if (lastSeen[t.name] && lastSeen[t.name] !== ids[0]) {
+              console.log(`🆕 ${t.name}: 新しい出品を検出！`);
+              newItems.push(`${t.name}: https://jp.mercari.com/item/${ids[0]}`);
             }
 
-            const id = item.id;
-            const price = parseInt(item.price || '0',10);
-            const status = item.status || '';
-            const url = `https://jp.mercari.com/item/${id}`;
-
-            // 新規出品 & 上限価格以下 & 販売中 を通知対象に
-            const isNew = seen[t.name] !== id;
-            const isOnSale = status.includes('TRADING') || status.includes('ON_SALE') || status === 'ITEM_STATUS_TRADING';
-            const priceOk = (t.maxPrice === 0) || (price > 0 && price <= t.maxPrice);
-
-            if (isNew && isOnSale && priceOk) {
-              foundMsgs.push(`- **${t.name}** 新着: ¥${price.toLocaleString()} → ${url}`);
-              seen[t.name] = id;  // 記録更新
-            } else {
-              // 初回実行で学習だけ／または条件合わず
-              if (!seen[t.name]) seen[t.name] = id;
-            }
+            lastSeen[t.name] = ids[0];
           }
 
           await browser.close();
+          fs.writeFileSync(lastSeenPath, JSON.stringify(lastSeen, null, 2));
 
-          // 結果を Summary に書く（GitHub Actions 画面で見える）
-          const linesOut = [];
-          if (foundMsgs.length) {
-            linesOut.push('## 🛎 新着検出\n', ...foundMsgs, '\n');
-          } else {
-            linesOut.push('新着はありません。');
+          if (newItems.length) {
+            fs.writeFileSync('new_items.txt', newItems.join('\n'));
           }
-          fs.appendFileSync(process.env.GITHUB_STEP_SUMMARY || 'summary.md', linesOut.join('\n'));
 
-          // 状態を保存
-          fs.writeFileSync(seenPath, JSON.stringify(seen, null, 2));
-          console.log('Watch 完了');
+          console.log("✅ Watch 完了");
           EOF
 
-      # 変更があれば last_seen.json をコミット（初回学習や新着時に更新）
       - name: Commit last_seen.json
         run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
           if git status --porcelain | grep -q "last_seen.json"; then
-            git config user.name "github-actions[bot]"
-            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
             git add last_seen.json
             git commit -m "chore: update last_seen.json"
             git push
-          else
-            echo "last_seen.json の変更なし"
           fi
+
+      - name: Send Gmail notification
+        if: success()
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: smtp.gmail.com
+          server_port: 465
+          username: ${{ secrets.MAIL_USERNAME }}
+          password: ${{ secrets.MAIL_PASSWORD }}
+          subject: "【Mercari】新しい出品がありました"
+          to: youraddress@gmail.com
+          from: Mercari Watcher <youraddress@gmail.com>
+          body: |
+            以下の新しい出品が検出されました：
+
+            ${{ steps.run.outputs.new_items }}
