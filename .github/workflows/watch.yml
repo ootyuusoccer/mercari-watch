@@ -2,7 +2,7 @@ name: Mercari Watch
 
 on:
   schedule:
-    - cron: "0,10,20,30,40,50 * * * *"   # 10分おき（UTC基準）
+    - cron: "0,10,20,30,40,50 * * * *"   # 10分おき（UTC）
   workflow_dispatch:
 
 permissions:
@@ -37,7 +37,7 @@ jobs:
       - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: 20   # ← cacheは削除済
+          node-version: 20
 
       # Playwright ブラウザキャッシュ
       - name: Cache Playwright browsers
@@ -70,7 +70,130 @@ jobs:
           MAIL_TO: ${{ secrets.MAIL_TO }}
         run: |
           node <<'EOF'
-          （あなたの既存の Node コードをそのままここに）
+          import fs from 'fs';
+          import nodemailer from 'nodemailer';
+          import { chromium } from 'playwright';
+
+          // ===== CSV =====
+          const csvPath = 'targets.csv';
+          if (!fs.existsSync(csvPath)) {
+            console.log('targets.csv がありません。');
+            process.exit(0);
+          }
+          const lines = fs.readFileSync(csvPath, 'utf8')
+            .split('\n').map(s => s.trim()).filter(Boolean);
+          const header = lines.shift(); // 1行目ヘッダ
+          const targets = lines.map(l => {
+            const [name, url, max_price] = l.split(',');
+            return { name, url, maxPrice: parseInt(max_price || '0', 10) || 0 };
+          });
+
+          // ===== last_seen =====
+          const seenPath = 'last_seen.json';
+          let seen = {};
+          try { seen = JSON.parse(fs.readFileSync(seenPath, 'utf8')); } catch {}
+
+          const browser = await chromium.launch({ headless: true });
+          const page = await browser.newPage();
+
+          const foundMsgs = [];
+          for (const t of targets) {
+            if (!t.url) continue;
+            console.log(`🔎 Checking: ${t.name}`);
+
+            // --- ページ遷移（タイムアウト時はスキップ） ---
+            try {
+              await page.goto(t.url, { waitUntil: 'domcontentloaded', timeout: 120000 });
+            } catch (e) {
+              console.log(`⚠️ ${t.name}: ページ遷移エラー (${e?.message || e})`);
+              continue;
+            }
+
+            // --- Mercari の検索APIレスポンス待ち（失敗はスキップ） ---
+            let data = null;
+            try {
+              const resp = await page.waitForResponse(
+                r => r.url().includes('/v2/entities:search') && r.ok(),
+                { timeout: 20000 }
+              );
+              data = await resp.json();
+            } catch (e) {
+              console.log(`⚠️ ${t.name}: 価格情報取得失敗 (${e?.message || e})`);
+              continue;
+            }
+
+            const item = (data?.items && data.items[0]) ? data.items[0] : null;
+            if (!item) { console.log(`⚠️ ${t.name}: ヒット0件`); continue; }
+
+            const id = item.id;
+            const price = parseInt(item.price || '0', 10);
+            const status = item.status || '';
+            const url = `https://jp.mercari.com/item/${id}`;
+
+            const isNew = seen[t.name] !== id;
+            const isOnSale = status.includes('TRADING') || status.includes('ON_SALE') || status === 'ITEM_STATUS_TRADING';
+            const priceOk = (t.maxPrice === 0) || (price > 0 && price <= t.maxPrice);
+
+            if (isNew && isOnSale && priceOk) {
+              foundMsgs.push({ name: t.name, price, url, id, prev: seen[t.name] || '' });
+              seen[t.name] = id;
+            } else {
+              if (!seen[t.name]) seen[t.name] = id;
+            }
+          }
+
+          await browser.close();
+
+          // ===== Summary =====
+          const linesOut = [];
+          if (foundMsgs.length) {
+            linesOut.push('## 🛎 新着検出\n');
+            for (const x of foundMsgs) {
+              linesOut.push(`- **${x.name}** 新着: ¥${x.price.toLocaleString()} → ${x.url}`);
+            }
+            linesOut.push('');
+          } else {
+            linesOut.push('新着はありません。');
+          }
+          fs.appendFileSync(process.env.GITHUB_STEP_SUMMARY || 'summary.md', linesOut.join('\n'));
+
+          // ===== Gmail 通知 =====
+          if (foundMsgs.length) {
+            const user = process.env.MAIL_USERNAME;
+            const pass = process.env.MAIL_PASSWORD;
+            const to   = process.env.MAIL_TO || user;
+
+            if (user && pass) {
+              const transporter = nodemailer.createTransport({
+                host: 'smtp.gmail.com',
+                port: 465,
+                secure: true,
+                auth: { user, pass }
+              });
+
+              const text = foundMsgs.map(x =>
+                `【${x.name}】¥${x.price}\n${x.url}\nnew:${x.id} prev:${x.prev}\n`
+              ).join('\n');
+
+              try {
+                await transporter.sendMail({
+                  from: user,
+                  to,
+                  subject: `Mercari 新着 ${foundMsgs.length}件`,
+                  text
+                });
+                console.log('📧 Gmail 送信 OK');
+              } catch (e) {
+                console.log('📧 Gmail 送信失敗:', e?.message || e);
+              }
+            } else {
+              console.log('📧 MAIL_USERNAME / MAIL_PASSWORD が未設定（通知スキップ）');
+            }
+          }
+
+          // ===== 状態保存 =====
+          fs.writeFileSync(seenPath, JSON.stringify(seen, null, 2));
+          console.log('Watch 完了');
           EOF
 
       # 実行時刻と last_seen.json の保存
