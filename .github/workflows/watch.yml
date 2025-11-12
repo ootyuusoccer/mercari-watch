@@ -2,7 +2,7 @@ name: Mercari Watch
 
 on:
   schedule:
-    - cron: "0,10,20,30,40,50 * * * *"  # 10分間隔の冗長化（UTC）
+    - cron: "0,10,20,30,40,50 * * * *"   # 10分おき（UTC基準）
   workflow_dispatch:
 
 permissions:
@@ -10,7 +10,7 @@ permissions:
 
 concurrency:
   group: mercari-watch
-  cancel-in-progress: true   # 重複起動を防止
+  cancel-in-progress: true
 
 jobs:
   check:
@@ -21,18 +21,15 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # 直近25分以内に実行済みなら即終了（無駄起動抑止）
+      # 直近25分以内に実行済みならスキップ
       - name: Guard - skip if ran within 25min
-        id: guard
         run: |
           NOW=$(date -u +%s)
           LAST=0
-          if [ -f .github/last_run_utc.txt ]; then
-            LAST=$(cat .github/last_run_utc.txt || echo 0)
-          fi
+          if [ -f .github/last_run_utc.txt ]; then LAST=$(cat .github/last_run_utc.txt || echo 0); fi
           DIFF=$((NOW - LAST))
-          echo "last_run_diff_sec=$DIFF" >> $GITHUB_OUTPUT
-          if [ $DIFF -lt 1500 ]; then   # 25min=1500sec
+          echo "Last run diff(sec): $DIFF"
+          if [ $DIFF -lt 1500 ]; then
             echo "Run skipped (last run $DIFF sec ago)."
             exit 0
           fi
@@ -40,17 +37,16 @@ jobs:
       - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: 20
-          cache: 'npm'           # npmキャッシュで高速化
+          node-version: 20   # ← cacheは削除済
 
-      # Playwright 本体のキャッシュ（ブラウザの再DLを抑止）
+      # Playwright ブラウザキャッシュ
       - name: Cache Playwright browsers
         uses: actions/cache@v4
         with:
           path: ~/.cache/ms-playwright
-          key: ${{ runner.os }}-pw-${{ hashFiles('package-lock.json') }}
+          key: ${{ runner.os }}-pw
           restore-keys: |
-            ${{ runner.os }}-pw-
+            ${{ runner.os }}-pw
 
       - name: Install system deps for Playwright
         run: |
@@ -62,7 +58,8 @@ jobs:
 
       - name: Install npm deps
         run: |
-          npm ci
+          npm i nodemailer
+          npm i -D playwright
           npx playwright install --with-deps chromium
 
       - name: Run Mercari Watcher
@@ -72,14 +69,16 @@ jobs:
           MAIL_PASSWORD: ${{ secrets.MAIL_PASSWORD }}
           MAIL_TO: ${{ secrets.MAIL_TO }}
         run: |
-          node ./your-script.js  # ← 今の Node <<EOF の中身をファイルに出して呼ぶだけでOK
+          node <<'EOF'
+          （あなたの既存の Node コードをそのままここに）
+          EOF
 
-      # 状態保存（最終実行時刻も書く）
-      - name: Save state files
+      # 実行時刻と last_seen.json の保存
+      - name: Save state
         run: |
           mkdir -p .github
           date -u +%s > .github/last_run_utc.txt
-          if git status --porcelain | grep -qE "last_seen.json|last_run_utc.txt"; then
+          if git status --porcelain | grep -qE "last_seen.json|.github/last_run_utc.txt"; then
             git config user.name "github-actions[bot]"
             git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
             git add last_seen.json .github/last_run_utc.txt
