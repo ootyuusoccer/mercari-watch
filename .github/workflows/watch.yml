@@ -1,54 +1,70 @@
 name: Mercari Watch
 
 on:
-   schedule:
-     - cron: "0,30 * * * *"   # 30分ごと
-   workflow_dispatch:
+  schedule:
+    - cron: "0,10,20,30,40,50 * * * *"  # 10分間隔の冗長化（UTC）
+  workflow_dispatch:
 
 permissions:
   contents: write
 
+concurrency:
+  group: mercari-watch
+  cancel-in-progress: true   # 重複起動を防止
+
 jobs:
   check:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      # 直近25分以内に実行済みなら即終了（無駄起動抑止）
+      - name: Guard - skip if ran within 25min
+        id: guard
+        run: |
+          NOW=$(date -u +%s)
+          LAST=0
+          if [ -f .github/last_run_utc.txt ]; then
+            LAST=$(cat .github/last_run_utc.txt || echo 0)
+          fi
+          DIFF=$((NOW - LAST))
+          echo "last_run_diff_sec=$DIFF" >> $GITHUB_OUTPUT
+          if [ $DIFF -lt 1500 ]; then   # 25min=1500sec
+            echo "Run skipped (last run $DIFF sec ago)."
+            exit 0
+          fi
+
       - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
           node-version: 20
+          cache: 'npm'           # npmキャッシュで高速化
 
-      # Playwright 実行に必要なライブラリ（Ubuntu 24.04 対応）※元のまま
-      - name: Install Playwright (browsers)
+      # Playwright 本体のキャッシュ（ブラウザの再DLを抑止）
+      - name: Cache Playwright browsers
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: ${{ runner.os }}-pw-${{ hashFiles('package-lock.json') }}
+          restore-keys: |
+            ${{ runner.os }}-pw-
+
+      - name: Install system deps for Playwright
         run: |
           sudo apt-get update
           sudo apt-get install -y \
-            libasound2t64 \
-            libnss3 \
-            libxss1 \
-            libgtk-3-0 \
-            libx11-xcb1 \
-            libxcb1 \
-            libxcomposite1 \
-            libxdamage1 \
-            libxrandr2 \
-            libgbm1 \
-            libpango-1.0-0 \
-            libcairo2 \
-            libatspi2.0-0 \
-            libdrm2
-          npm i -D playwright
-          npx playwright install --with-deps chromium
+            libasound2t64 libnss3 libxss1 libgtk-3-0 libx11-xcb1 \
+            libxcb1 libxcomposite1 libxdamage1 libxrandr2 libgbm1 \
+            libpango-1.0-0 libcairo2 libatspi2.0-0 libdrm2
 
-      # nodemailer を入れる（通知用・軽量）
       - name: Install npm deps
         run: |
-          npm i nodemailer
+          npm ci
+          npx playwright install --with-deps chromium
 
-      # 巡回＆新着検出（元コード）＋ 新着時に Gmail 通知
       - name: Run Mercari Watcher
         env:
           GITHUB_STEP_SUMMARY: ${{ github.step_summary }}
@@ -56,133 +72,19 @@ jobs:
           MAIL_PASSWORD: ${{ secrets.MAIL_PASSWORD }}
           MAIL_TO: ${{ secrets.MAIL_TO }}
         run: |
-          node <<'EOF'
-          import fs from 'fs';
-          import nodemailer from 'nodemailer';
-          import { chromium } from 'playwright';
+          node ./your-script.js  # ← 今の Node <<EOF の中身をファイルに出して呼ぶだけでOK
 
-          // ===== 既存どおり：targets.csv 取り込み =====
-          const csvPath = 'targets.csv';
-          if (!fs.existsSync(csvPath)) { console.log('targets.csv がありません。'); process.exit(0); }
-          const lines = fs.readFileSync(csvPath,'utf8')
-            .split('\n').map(s=>s.trim()).filter(Boolean);
-          const header = lines.shift(); // 1行目ヘッダ
-          const targets = lines.map(l=>{
-            const [name,url,max_price] = l.split(',');
-            return { name, url, maxPrice: parseInt(max_price||'0',10) || 0 };
-          });
-
-          // ===== 既存どおり：last_seen.json 読み書き =====
-          const seenPath = 'last_seen.json';
-          let seen = {};
-          try { seen = JSON.parse(fs.readFileSync(seenPath,'utf8')); } catch {}
-
-          const browser = await chromium.launch({ headless: true });
-          const page = await browser.newPage();
-
-          const foundMsgs = [];
-          for (const t of targets) {
-            if (!t.url) continue;
-            console.log(`🔎 Checking: ${t.name}`);
-
-            await page.goto(t.url, { waitUntil: 'domcontentloaded', timeout: 60000 });
-
-            // Mercari の SPA が投げる API 応答（entities:search）を待つ
-            let data = null;
-            try {
-              const resp = await page.waitForResponse(
-                r => r.url().includes('/v2/entities:search') && r.ok(),
-                { timeout: 15000 }
-              );
-              data = await resp.json();
-            } catch {
-              console.log(`⚠️ ${t.name}: 価格情報が取得できませんでした`);
-              continue;
-            }
-
-            const item = (data?.items && data.items[0]) ? data.items[0] : null;
-            if (!item) { console.log(`⚠️ ${t.name}: ヒット0件`); continue; }
-
-            const id = item.id;
-            const price = parseInt(item.price || '0',10);
-            const status = item.status || '';
-            const url = `https://jp.mercari.com/item/${id}`;
-
-            const isNew = seen[t.name] !== id;
-            const isOnSale = status.includes('TRADING') || status.includes('ON_SALE') || status === 'ITEM_STATUS_TRADING';
-            const priceOk = (t.maxPrice === 0) || (price > 0 && price <= t.maxPrice);
-
-            if (isNew && isOnSale && priceOk) {
-              foundMsgs.push({ name: t.name, price, url, id, prev: seen[t.name] || '' });
-              seen[t.name] = id;  // 記録更新
-            } else {
-              if (!seen[t.name]) seen[t.name] = id; // 初回は学習だけ
-            }
-          }
-
-          await browser.close();
-
-          // ===== Summary（元の表示） =====
-          const linesOut = [];
-          if (foundMsgs.length) {
-            linesOut.push('## 🛎 新着検出\n');
-            for (const x of foundMsgs) {
-              linesOut.push(`- **${x.name}** 新着: ¥${x.price.toLocaleString()} → ${x.url}`);
-            }
-            linesOut.push('');
-          } else {
-            linesOut.push('新着はありません。');
-          }
-          fs.appendFileSync(process.env.GITHUB_STEP_SUMMARY || 'summary.md', linesOut.join('\n'));
-
-          // ===== Gmail 通知（新着がある時だけ） =====
-          if (foundMsgs.length) {
-            const user = process.env.MAIL_USERNAME;
-            const pass = process.env.MAIL_PASSWORD;
-            const to   = process.env.MAIL_TO || user;
-
-            if (user && pass) {
-              const transporter = nodemailer.createTransport({
-                host: 'smtp.gmail.com',
-                port: 465,
-                secure: true,
-                auth: { user, pass }
-              });
-
-              const text = foundMsgs.map(x =>
-                `【${x.name}】¥${x.price}\n${x.url}\nnew:${x.id} prev:${x.prev}\n`
-              ).join('\n');
-
-              try {
-                await transporter.sendMail({
-                  from: user,
-                  to,
-                  subject: `Mercari 新着 ${foundMsgs.length}件`,
-                  text
-                });
-                console.log('📧 Gmail 送信 OK');
-              } catch (e) {
-                console.log('📧 Gmail 送信失敗:', e?.message || e);
-              }
-            } else {
-              console.log('📧 MAIL_USERNAME / MAIL_PASSWORD が未設定（通知スキップ）');
-            }
-          }
-
-          // ===== 状態保存（既存どおり） =====
-          fs.writeFileSync(seenPath, JSON.stringify(seen, null, 2));
-          console.log('Watch 完了');
-          EOF
-
-      # 変更があれば last_seen.json をコミット（元のまま）
-      - name: Commit last_seen.json
+      # 状態保存（最終実行時刻も書く）
+      - name: Save state files
         run: |
-          if git status --porcelain | grep -q "last_seen.json"; then
+          mkdir -p .github
+          date -u +%s > .github/last_run_utc.txt
+          if git status --porcelain | grep -qE "last_seen.json|last_run_utc.txt"; then
             git config user.name "github-actions[bot]"
             git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-            git add last_seen.json
-            git commit -m "chore: update last_seen.json"
+            git add last_seen.json .github/last_run_utc.txt
+            git commit -m "chore: update state (last_seen, last_run)"
             git push
           else
-            echo "last_seen.json の変更なし"
+            echo "no state changes"
           fi
