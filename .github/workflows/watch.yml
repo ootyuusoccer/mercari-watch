@@ -82,10 +82,19 @@ jobs:
           }
           const lines = fs.readFileSync(csvPath, 'utf8')
             .split('\n').map(s => s.trim()).filter(Boolean);
-          const header = lines.shift(); // 1行目ヘッダ
+
+          // 1行目ヘッダを捨てる
+          lines.shift();
+
+          // name, url, max_price, min_price
           const targets = lines.map(l => {
-            const [name, url, max_price] = l.split(',');
-            return { name, url, maxPrice: parseInt(max_price || '0', 10) || 0 };
+            const [name, url, max_price, min_price] = l.split(',');
+            return {
+              name,
+              url,
+              maxPrice: parseInt(max_price || '0', 10) || 0,
+              minPrice: parseInt(min_price || '0', 10) || 0
+            };
           });
 
           // ===== last_seen =====
@@ -101,7 +110,7 @@ jobs:
             if (!t.url) continue;
             console.log(`🔎 Checking: ${t.name}`);
 
-            // --- ページ遷移（タイムアウト時はスキップ） ---
+            // --- ページ遷移 ---
             try {
               await page.goto(t.url, { waitUntil: 'domcontentloaded', timeout: 120000 });
             } catch (e) {
@@ -109,7 +118,7 @@ jobs:
               continue;
             }
 
-            // --- Mercari の検索APIレスポンス待ち（失敗はスキップ） ---
+            // --- Mercari 検索APIレスポンス待ち ---
             let data = null;
             try {
               const resp = await page.waitForResponse(
@@ -130,9 +139,17 @@ jobs:
             const status = item.status || '';
             const url = `https://jp.mercari.com/item/${id}`;
 
+            // 条件計算
             const isNew = seen[t.name] !== id;
-            const isOnSale = status.includes('TRADING') || status.includes('ON_SALE') || status === 'ITEM_STATUS_TRADING';
-            const priceOk = (t.maxPrice === 0) || (price > 0 && price <= t.maxPrice);
+
+            const isOnSale =
+              status.includes('TRADING') ||
+              status.includes('ON_SALE') ||
+              status === 'ITEM_STATUS_TRADING';
+
+            const priceOk =
+              (t.maxPrice === 0 || price <= t.maxPrice) &&
+              (t.minPrice === 0 || price >= t.minPrice);
 
             if (isNew && isOnSale && priceOk) {
               foundMsgs.push({ name: t.name, price, url, id, prev: seen[t.name] || '' });
