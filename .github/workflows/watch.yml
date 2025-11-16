@@ -89,18 +89,21 @@ jobs:
           // name, url, max_price, min_price
           const targets = lines.map(l => {
             const [name, url, max_price, min_price] = l.split(',');
+
             return {
               name,
               url,
-              maxPrice: parseInt(max_price || '0', 10) || 0,
-              minPrice: parseInt(min_price || '0', 10) || 0
+              maxPrice: parseInt(max_price || '0', 10) || 0,  // 0なら上限なし
+              minPrice: parseInt(min_price || '0', 10) || 0   // 0なら下限なし
             };
           });
 
           // ===== last_seen =====
           const seenPath = 'last_seen.json';
           let seen = {};
-          try { seen = JSON.parse(fs.readFileSync(seenPath, 'utf8')); } catch {}
+          try {
+            seen = JSON.parse(fs.readFileSync(seenPath, 'utf8'));
+          } catch {}
 
           const browser = await chromium.launch({ headless: true });
           const page = await browser.newPage();
@@ -132,12 +135,16 @@ jobs:
             }
 
             const item = (data?.items && data.items[0]) ? data.items[0] : null;
-            if (!item) { console.log(`⚠️ ${t.name}: ヒット0件`); continue; }
+            if (!item) {
+              console.log(`⚠️ ${t.name}: ヒット0件`);
+              continue;
+            }
 
             const id = item.id;
             const price = parseInt(item.price || '0', 10);
             const status = item.status || '';
-            const url = `https://jp.mercari.com/item/${id}`;
+            const detailUrl = `https://jp.mercari.com/item/${id}`;
+            const searchUrl = t.url; // ← 新着順の検索結果URL（CSVのurl）
 
             // 条件計算
             const isNew = seen[t.name] !== id;
@@ -152,7 +159,14 @@ jobs:
               (t.minPrice === 0 || price >= t.minPrice);
 
             if (isNew && isOnSale && priceOk) {
-              foundMsgs.push({ name: t.name, price, url, id, prev: seen[t.name] || '' });
+              foundMsgs.push({
+                name: t.name,
+                price,
+                url: detailUrl,   // 個別商品URL
+                searchUrl,        // 検索結果URL（新着順）
+                id,
+                prev: seen[t.name] || ''
+              });
               seen[t.name] = id;
             } else {
               if (!seen[t.name]) seen[t.name] = id;
@@ -166,7 +180,10 @@ jobs:
           if (foundMsgs.length) {
             linesOut.push('## 🛎 新着検出\n');
             for (const x of foundMsgs) {
-              linesOut.push(`- **${x.name}** 新着: ¥${x.price.toLocaleString()} → ${x.url}`);
+              // GitHub のサマリーからは「検索結果（新着順）」に飛ぶ
+              linesOut.push(
+                `- **${x.name}** 新着: ¥${x.price.toLocaleString()} → ${x.searchUrl}`
+              );
             }
             linesOut.push('');
           } else {
@@ -189,7 +206,13 @@ jobs:
               });
 
               const text = foundMsgs.map(x =>
-                `【${x.name}】¥${x.price}\n${x.url}\nnew:${x.id} prev:${x.prev}\n`
+                [
+                  `【${x.name}】¥${x.price}`,
+                  `検索結果(新着順): ${x.searchUrl}`,
+                  `商品詳細: ${x.url}`,
+                  `new:${x.id} prev:${x.prev}`,
+                  ''
+                ].join('\n')
               ).join('\n');
 
               try {
